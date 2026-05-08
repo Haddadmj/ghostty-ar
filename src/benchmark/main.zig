@@ -7,6 +7,7 @@ pub const GraphemeBreak = @import("GraphemeBreak.zig");
 pub const ScreenClone = @import("ScreenClone.zig");
 pub const TerminalParser = @import("TerminalParser.zig");
 pub const IsSymbol = @import("IsSymbol.zig");
+pub const BidiScan = @import("BidiScan.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
