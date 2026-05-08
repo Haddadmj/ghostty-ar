@@ -11,6 +11,7 @@ const terminal = @import("../terminal/main.zig");
 const renderer = @import("../renderer.zig");
 const math = @import("../math.zig");
 const Surface = @import("../Surface.zig");
+const bidi = @import("bidi.zig");
 const link = @import("link.zig");
 const cellpkg = @import("cell.zig");
 const noMinContrast = cellpkg.noMinContrast;
@@ -2520,14 +2521,29 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 if (style == .block) {
                     const wide = state.cursor.cell.wide;
 
+                    // Logical column under the spacer-tail correction; spacer
+                    // tails reuse the wide cell's leading column so the cursor
+                    // does not overflow.
+                    const cursor_logical_x: u16 = switch (wide) {
+                        .narrow, .spacer_head, .wide => cursor_vp.x,
+                        .spacer_tail => cursor_vp.x -| 1,
+                    };
+
+                    // Map to visual column for rows that contain RTL content.
+                    // Failure falls back to the logical column so a transient
+                    // OOM only mispositions the cursor, never the frame.
+                    const cursor_visual_x: u16 = visual: {
+                        const cells_slice = row_cells[cursor_vp.y].slice();
+                        const cells_raw = cells_slice.items(.raw);
+                        break :visual bidi.logicalToVisualX(
+                            self.alloc,
+                            cells_raw,
+                            cursor_logical_x,
+                        ) catch cursor_logical_x;
+                    };
+
                     self.uniforms.cursor_pos = .{
-                        // If we are a spacer tail of a wide cell, our cursor needs
-                        // to move back one cell. The saturate is to ensure we don't
-                        // overflow but this shouldn't happen with well-formed input.
-                        switch (wide) {
-                            .narrow, .spacer_head, .wide => cursor_vp.x,
-                            .spacer_tail => cursor_vp.x -| 1,
-                        },
+                        cursor_visual_x,
                         @intCast(cursor_vp.y),
                     };
 
