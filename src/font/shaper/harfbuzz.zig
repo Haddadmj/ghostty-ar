@@ -760,6 +760,103 @@ test "shape arabic forced LTR" {
     try testing.expectEqual(@as(usize, 1), count);
 }
 
+test "run iterator: arabic row tags rtl" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var testdata = try testShaperWithFont(alloc, .arabic);
+    defer testdata.deinit();
+
+    var t = try terminal.Terminal.init(alloc, .{ .cols = 30, .rows = 3 });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("\u{0645}\u{0631}\u{062D}\u{0628}\u{0627}");
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    var shaper = &testdata.shaper;
+    var it = shaper.runIterator(.{
+        .grid = testdata.grid,
+        .cells = state.row_data.get(0).cells.slice(),
+    });
+    var count: usize = 0;
+    while (try it.next(alloc)) |run| {
+        count += 1;
+        try testing.expect(run.rtl);
+    }
+    try testing.expectEqual(@as(usize, 1), count);
+}
+
+test "run iterator: mixed latin arabic produces split runs" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var testdata = try testShaperWithFont(alloc, .arabic);
+    defer testdata.deinit();
+
+    var t = try terminal.Terminal.init(alloc, .{ .cols = 30, .rows = 3 });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("Hi \u{0645}\u{0631}\u{062D}\u{0628}\u{0627}");
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    var shaper = &testdata.shaper;
+    var it = shaper.runIterator(.{
+        .grid = testdata.grid,
+        .cells = state.row_data.get(0).cells.slice(),
+    });
+    var count: usize = 0;
+    var saw_ltr = false;
+    var saw_rtl = false;
+    while (try it.next(alloc)) |run| {
+        count += 1;
+        if (run.rtl) saw_rtl = true else saw_ltr = true;
+    }
+    try testing.expect(count >= 2);
+    try testing.expect(saw_ltr);
+    try testing.expect(saw_rtl);
+}
+
+test "run iterator: ltr-only fast path leaves rtl false" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var testdata = try testShaper(alloc);
+    defer testdata.deinit();
+
+    var t = try terminal.Terminal.init(alloc, .{ .cols = 10, .rows = 3 });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("ABCD");
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    var shaper = &testdata.shaper;
+    var it = shaper.runIterator(.{
+        .grid = testdata.grid,
+        .cells = state.row_data.get(0).cells.slice(),
+    });
+    var count: usize = 0;
+    while (try it.next(alloc)) |run| {
+        count += 1;
+        try testing.expect(!run.rtl);
+    }
+    try testing.expectEqual(@as(usize, 1), count);
+}
+
 test "shape emoji width" {
     const testing = std.testing;
     const alloc = testing.allocator;
