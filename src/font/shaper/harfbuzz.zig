@@ -167,6 +167,34 @@ pub const Shaper = struct {
         // This keeps track of the cell starting x and cluster.
         var cell_offset: CellOffset = .{};
 
+        // For RTL, build a per-cluster prefix-sum of absorbed clusters so
+        // each emitted glyph at cluster C lands at visual cell
+        //   (run.cells - 1) - (C - absorbed_below[C])
+        // i.e. the natural mirror position pulled rightward by however many
+        // clusters were absorbed BELOW C. This packs emitted glyphs to the
+        // right edge of the run with the absorbed cells collected at the
+        // LEFT edge, where they merge with trailing whitespace in reading
+        // order instead of opening a gap mid-word. Iteration-order
+        // independent so it works regardless of HB output order.
+        const rtl_absorbed_below: ?[]u32 = if (run.rtl) blk: {
+            const cells_n: usize = @intCast(run.cells);
+            const emitted = try self.alloc.alloc(bool, cells_n);
+            defer self.alloc.free(emitted);
+            @memset(emitted, false);
+            for (info) |info_v| {
+                const c = self.codepoints.items[info_v.cluster].cluster;
+                if (c < cells_n) emitted[c] = true;
+            }
+            const absorbed = try self.alloc.alloc(u32, cells_n);
+            var sum: u32 = 0;
+            for (0..cells_n) |k| {
+                absorbed[k] = sum;
+                if (!emitted[k]) sum += 1;
+            }
+            break :blk absorbed;
+        } else null;
+        defer if (rtl_absorbed_below) |a| self.alloc.free(a);
+
         // Convert all our info/pos to cells and set it.
         self.cell_buf.clearRetainingCapacity();
         for (info, pos) |info_v, pos_v| {
@@ -246,14 +274,16 @@ pub const Shaper = struct {
             // For debugging positions, turn this on:
             //try self.debugPositions(run_offset, cell_offset, pos_v, index);
 
-            // RTL runs receive HarfBuzz output in visual order with each
-            // glyph's cluster pointing to its logical input position. Mirror
-            // the cluster within the run so the leftmost visual glyph lands
-            // in the leftmost cell.
-            const visual_x: u16 = if (run.rtl)
-                run.cells -| 1 -| @as(u16, @intCast(cell_offset.cluster))
-            else
-                @intCast(cell_offset.cluster);
+            // RTL: cluster value drives cell.x via the absorbed-below
+            // prefix sum. LTR keeps the existing cluster-anchored layout.
+            const visual_x: u16 = if (rtl_absorbed_below) |absorbed| blk: {
+                const c_idx: usize = @intCast(cluster);
+                const adj: u32 = if (c_idx < absorbed.len)
+                    absorbed[c_idx]
+                else
+                    0;
+                break :blk @intCast(@as(u32, run.cells) -| 1 -| (cluster -| adj));
+            } else @intCast(cell_offset.cluster);
 
             try self.cell_buf.append(self.alloc, .{
                 .x = visual_x,
@@ -793,6 +823,45 @@ test "shape arabic" {
         }
     }
     try testing.expectEqual(@as(usize, 1), count);
+}
+
+test "shape arabic packs absorbed cells to left edge" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var testdata = try testShaperWithFont(alloc, .arabic);
+    defer testdata.deinit();
+
+    var t = try terminal.Terminal.init(alloc, .{ .cols = 120, .rows = 30 });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice(@embedFile("testdata/arabic.txt"));
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    var shaper = &testdata.shaper;
+    var it = shaper.runIterator(.{
+        .grid = testdata.grid,
+        .cells = state.row_data.get(0).cells.slice(),
+    });
+    while (try it.next(alloc)) |run| {
+        try testing.expect(run.rtl);
+        const cells = try shaper.shape(run);
+        if (cells.len == run.cells) continue; // no ligature, no shift expected
+
+        // When the font collapses ligatures (e.g. lam-alef), the absorbed
+        // cells should fall on the LEFT edge of the run rather than open
+        // a gap inside the visible word. The first emitted cell's x must
+        // therefore equal `run.cells - cells.len` exactly.
+        const expected_shift: u16 = @intCast(run.cells - cells.len);
+        try testing.expectEqual(expected_shift, cells[0].x);
+        // And the last emitted cell must reach the right edge of the run.
+        try testing.expectEqual(@as(u16, @intCast(run.cells - 1)), cells[cells.len - 1].x);
+    }
 }
 
 test "run iterator: arabic row tags rtl" {

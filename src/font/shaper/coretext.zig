@@ -424,6 +424,38 @@ pub const Shaper = struct {
         // other so we can iterate over them and just append to our
         // cell buffer.
         const runs = line.getGlyphRuns();
+
+        // For RTL, build a per-cluster prefix-sum of absorbed clusters so
+        // each emitted glyph at cluster C lands at visual cell
+        //   (run.cells - 1) - (C - absorbed_below[C])
+        // i.e. the natural mirror position pulled rightward by however many
+        // clusters were absorbed BELOW C. This packs emitted glyphs to the
+        // right edge of the run with the absorbed cells collected at the
+        // LEFT edge, where they merge with trailing whitespace in reading
+        // order instead of opening a gap mid-word. Iteration-order
+        // independent so it works regardless of CoreText's sub-run ordering.
+        const rtl_absorbed_below: ?[]u32 = if (run.rtl) blk: {
+            const cells_n: usize = @intCast(run.cells);
+            const emitted = try alloc.alloc(bool, cells_n);
+            @memset(emitted, false);
+            for (0..runs.getCount()) |run_i2| {
+                const ctrun2 = runs.getValueAtIndex(macos.text.Run, run_i2);
+                const inds = ctrun2.getStringIndicesPtr() orelse
+                    try ctrun2.getStringIndices(alloc);
+                for (inds) |idx| {
+                    const c = state.codepoints.items[idx].cluster;
+                    if (c < cells_n) emitted[c] = true;
+                }
+            }
+            const absorbed = try alloc.alloc(u32, cells_n);
+            var sum: u32 = 0;
+            for (0..cells_n) |k| {
+                absorbed[k] = sum;
+                if (!emitted[k]) sum += 1;
+            }
+            break :blk absorbed;
+        } else null;
+
         for (0..runs.getCount()) |run_i| {
             const ctrun = runs.getValueAtIndex(macos.text.Run, run_i);
 
@@ -526,14 +558,16 @@ pub const Shaper = struct {
 
                 const x_offset = position.x - cell_offset.x;
 
-                // RTL runs receive CoreText output in visual order with each
-                // glyph's index pointing to its logical input position. Mirror
-                // the cluster within the run so the leftmost visual glyph
-                // lands in the leftmost cell.
-                const visual_x: u16 = if (run.rtl)
-                    run.cells -| 1 -| @as(u16, @intCast(cell_offset.cluster))
-                else
-                    @intCast(cell_offset.cluster);
+                // RTL: cluster value drives cell.x via the absorbed-below
+                // prefix sum. LTR keeps the cluster-anchored layout.
+                const visual_x: u16 = if (rtl_absorbed_below) |absorbed| blk: {
+                    const c_idx: usize = @intCast(cluster);
+                    const adj: u32 = if (c_idx < absorbed.len)
+                        absorbed[c_idx]
+                    else
+                        0;
+                    break :blk @intCast(@as(u32, run.cells) -| 1 -| (cluster -| adj));
+                } else @intCast(cell_offset.cluster);
 
                 self.cell_buf.appendAssumeCapacity(.{
                     .x = visual_x,
