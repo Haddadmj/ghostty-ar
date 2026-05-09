@@ -1424,6 +1424,19 @@ link: RepeatableLink = .{},
 /// `link`). If you want to customize URL matching, use `link` and disable this.
 @"link-url": bool = true,
 
+/// Right-justify rows whose UAX #9 base direction resolves to right-to-left.
+///
+/// When enabled, a row whose first strong directional character is RTL
+/// (Arabic, Hebrew, etc.) is rendered with its content pushed to the right
+/// edge of the terminal, matching how a native Arabic or Hebrew reader
+/// expects the line to align. LTR-base rows are unaffected.
+///
+/// This is opt-in because Ghostty enforces strict monospace and shifting
+/// rows can interact unexpectedly with applications that draw to specific
+/// columns. Pure-RTL output (e.g. `cat arabic-text.txt`) benefits the
+/// most.
+@"rtl-justify": bool = false,
+
 /// Show link previews for a matched URL.
 ///
 /// When true, link previews are shown for all matched URLs. When false, link

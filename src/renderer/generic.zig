@@ -571,6 +571,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             blending: configpkg.Config.AlphaBlending,
             background_blur: configpkg.Config.BackgroundBlur,
             scroll_to_bottom_on_output: bool,
+            rtl_justify: bool,
 
             pub fn init(
                 alloc_gpa: Allocator,
@@ -610,6 +611,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .background_opacity_cells = config.@"background-opacity-cells",
                     .font_thicken = config.@"font-thicken",
                     .font_thicken_strength = config.@"font-thicken-strength",
+                    .rtl_justify = config.@"rtl-justify",
                     .font_features = font_features.list,
                     .font_styles = font_styles,
                     .font_shaping_break = config.@"font-shaping-break",
@@ -2691,11 +2693,37 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             var shaper_cells: ?[]const font.shape.Cell = null;
             var shaper_cells_i: usize = 0;
 
+            // Right-justify rows whose UAX #9 base direction resolves to RTL
+            // when the user opts in via the rtl-justify config. We barrel-roll
+            // the row by `content_count` cells so non-empty content lands at
+            // the right edge and the leading empty cells fill the left.
+            const content_count: u16 = if (self.config.rtl_justify and
+                cells_len > 0 and
+                bidi.paragraphIsRTL(
+                    self.alloc,
+                    cells_raw[0..cells_len],
+                ) catch false)
+            count: {
+                const last = bidi.lastFilledCell(cells_raw[0..cells_len]) orelse
+                    break :count 0;
+                break :count @intCast(last + 1);
+            } else 0;
+
             for (
                 0..,
                 cells_raw[0..cells_len],
                 cells_style[0..cells_len],
             ) |x, *cell, *managed_style| {
+                // Translate the source cell column to its visual column. When
+                // right-justify is inactive this is the identity. Otherwise
+                // non-empty source cells slide to the right edge and the
+                // trailing empty source cells wrap around to fill the left.
+                const visual_x: u16 = if (content_count == 0)
+                    @intCast(x)
+                else if (x < content_count)
+                    @intCast(x + (state.cols - content_count))
+                else
+                    @intCast(x - content_count);
                 // If this cell falls within our preedit range then we
                 // skip this because preedits are setup separately.
                 if (preedit_range) |range| preedit: {
@@ -2926,7 +2954,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         break :bg_alpha 0;
                     };
 
-                    self.cells.bgCell(y, x).* = .{
+                    self.cells.bgCell(y, visual_x).* = .{
                         rgb.r, rgb.g, rgb.b, bg_alpha,
                     };
                 }
@@ -2963,7 +2991,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // This improves readability when a colored underline is used
                 // which intersects parts of the text (descenders).
                 if (underline != .none) self.addUnderline(
-                    @intCast(x),
+                    @intCast(visual_x),
                     @intCast(y),
                     underline,
                     style.underlineColor(&state.colors.palette) orelse fg,
@@ -2971,11 +2999,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 ) catch |err| {
                     log.warn(
                         "error adding underline to cell, will be invalid x={} y={}, err={}",
-                        .{ x, y, err },
+                        .{ visual_x, y, err },
                     );
                 };
 
-                if (style.flags.overline) self.addOverline(@intCast(x), @intCast(y), fg, alpha) catch |err| {
+                if (style.flags.overline) self.addOverline(@intCast(visual_x), @intCast(y), fg, alpha) catch |err| {
                     log.warn(
                         "error adding overline to cell, will be invalid x={} y={}, err={}",
                         .{ x, y, err },
@@ -3039,7 +3067,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         shaper_cells_i += 1;
                     }) {
                         self.addGlyph(
-                            @intCast(x),
+                            @intCast(visual_x),
                             @intCast(y),
                             state.cols,
                             cells_raw,
@@ -3050,7 +3078,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         ) catch |err| {
                             log.warn(
                                 "error adding glyph to cell, will be invalid x={} y={}, err={}",
-                                .{ x, y, err },
+                                .{ visual_x, y, err },
                             );
                         };
                     }
@@ -3058,7 +3086,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 // Finally, draw a strikethrough if necessary.
                 if (style.flags.strikethrough) self.addStrikethrough(
-                    @intCast(x),
+                    @intCast(visual_x),
                     @intCast(y),
                     fg,
                     alpha,

@@ -50,6 +50,41 @@ fn rowHasRtl(cells: []const terminal.page.Cell) bool {
     return false;
 }
 
+/// Resolve the row's UAX #9 paragraph direction. `auto_ltr` defers to the
+/// first strong directional character: pure-Arabic and pure-Hebrew rows
+/// resolve RTL, mixed-script rows usually resolve LTR (their first strong
+/// run is typically Latin). LTR-only rows early-exit without allocating.
+pub fn paragraphIsRTL(
+    alloc: Allocator,
+    cells: []const terminal.page.Cell,
+) !bool {
+    if (!rowHasRtl(cells)) return false;
+
+    const cps = try alloc.alloc(u21, cells.len);
+    defer alloc.free(cps);
+    for (cells, 0..) |cell, idx| {
+        const cp: u32 = cell.codepoint();
+        cps[idx] = if (cp == 0) ' ' else @intCast(cp);
+    }
+
+    var dir: itijah.ParDirection = .auto_ltr;
+    const emb = try itijah.getParEmbeddingLevels(alloc, cps, &dir);
+    defer alloc.free(emb.levels);
+
+    return dir == .rtl or dir == .auto_rtl;
+}
+
+/// Index of the rightmost cell holding visible content, or null if the row
+/// is empty. Used to compute the right-justify shift.
+pub fn lastFilledCell(cells: []const terminal.page.Cell) ?usize {
+    var i: usize = cells.len;
+    while (i > 0) {
+        i -= 1;
+        if (!cells[i].isEmpty()) return i;
+    }
+    return null;
+}
+
 test "logicalToVisualX: ltr-only row returns input" {
     const testing = std.testing;
     const alloc = testing.allocator;
