@@ -74,6 +74,34 @@ pub fn paragraphIsRTL(
     return dir == .rtl or dir == .auto_rtl;
 }
 
+/// Build the row's logical-to-visual column map under UAX #9. Returns null
+/// when the row has no strong-RTL codepoints so callers can early-exit on
+/// the LTR fast path. Caller owns the returned slice.
+pub fn logToVisMap(
+    alloc: Allocator,
+    cells: []const terminal.page.Cell,
+) !?[]u16 {
+    if (!rowHasRtl(cells)) return null;
+
+    const cps = try alloc.alloc(u21, cells.len);
+    defer alloc.free(cps);
+    for (cells, 0..) |cell, idx| {
+        const cp: u32 = cell.codepoint();
+        cps[idx] = if (cp == 0) ' ' else @intCast(cp);
+    }
+
+    var dir: itijah.ParDirection = .ltr;
+    const emb = try itijah.getParEmbeddingLevels(alloc, cps, &dir);
+    defer alloc.free(emb.levels);
+
+    const l_to_v = try itijah.logToVis(alloc, emb.levels, dir.toLevel());
+    defer alloc.free(l_to_v);
+
+    const out = try alloc.alloc(u16, cells.len);
+    for (l_to_v, 0..) |v, i| out[i] = @intCast(v);
+    return out;
+}
+
 /// Index of the rightmost cell holding visible content, or null if the row
 /// is empty. Used to compute the right-justify shift.
 pub fn lastFilledCell(cells: []const terminal.page.Cell) ?usize {

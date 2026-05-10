@@ -2693,6 +2693,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             var shaper_cells: ?[]const font.shape.Cell = null;
             var shaper_cells_i: usize = 0;
 
+            // UAX #9 logical-to-visual map for the row. Null on LTR rows so
+            // the hot loop skips the lookup. Allocated once per row.
+            const log_to_vis: ?[]u16 = bidi.logToVisMap(
+                self.alloc,
+                cells_raw[0..cells_len],
+            ) catch null;
+            defer if (log_to_vis) |m| self.alloc.free(m);
+
             // Right-justify rows whose UAX #9 base direction resolves to RTL
             // when the user opts in via the rtl-justify config. We barrel-roll
             // the row by `content_count` cells so non-empty content lands at
@@ -2714,16 +2722,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 cells_raw[0..cells_len],
                 cells_style[0..cells_len],
             ) |x, *cell, *managed_style| {
-                // Translate the source cell column to its visual column. When
-                // right-justify is inactive this is the identity. Otherwise
-                // non-empty source cells slide to the right edge and the
-                // trailing empty source cells wrap around to fill the left.
-                const visual_x: u16 = if (content_count == 0)
-                    @intCast(x)
-                else if (x < content_count)
-                    @intCast(x + (state.cols - content_count))
+                // Apply UAX #9 reorder first so RTL spans display in reading
+                // order. Then optionally barrel-roll for right-justify. LTR
+                // rows hit the fast path where reordered == x.
+                const reordered: u16 = if (log_to_vis) |m|
+                    m[x]
                 else
-                    @intCast(x - content_count);
+                    @intCast(x);
+                const visual_x: u16 = if (content_count == 0)
+                    reordered
+                else if (reordered < content_count)
+                    reordered + (state.cols - content_count)
+                else
+                    reordered - content_count;
                 // If this cell falls within our preedit range then we
                 // skip this because preedits are setup separately.
                 if (preedit_range) |range| preedit: {
