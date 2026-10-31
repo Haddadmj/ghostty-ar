@@ -441,6 +441,12 @@ pub const Shaper = struct {
             assert(glyphs.len == positions.len);
             assert(glyphs.len == indices.len);
 
+            // In an RTL line, CoreText emits trailing whitespace as its own
+            // run at a negative x, then restarts the next run at zero. Follow
+            // each run's real origin or those advances push everything after
+            // the whitespace a cell to the left.
+            if (run.rtl and positions.len > 0) run_offset.x = positions[0].x;
+
             for (
                 glyphs,
                 advances,
@@ -544,6 +550,13 @@ pub const Shaper = struct {
                 //run_offset_y += advance.height;
             }
         }
+
+        if (run.rtl) try font.shape.packRtlCells(
+            alloc,
+            self.cell_buf.items,
+            state.codepoints.items,
+            run.cells,
+        );
 
         // The renderer assumes monotonic-increasing x. RTL runs and
         // non-monotonic LTR runs both need a sort to get there.
@@ -1051,6 +1064,101 @@ test "shape" {
         _ = try shaper.shape(run);
     }
     try testing.expectEqual(@as(usize, 1), count);
+}
+
+test "shape rtl: trailing space does not shift the glyphs before it" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var testdata = testShaperWithDiscoveredFont(alloc, "Menlo") catch return error.SkipZigTest;
+    defer testdata.deinit();
+
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 10, .rows = 3 });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("\u{0645}| ");
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    var shaper = &testdata.shaper;
+    var it = shaper.runIterator(.{
+        .grid = testdata.grid,
+        .cells = state.row_data.get(0).cells.slice(),
+    });
+    defer it.deinit(alloc);
+    var checked = false;
+    while (try it.next(alloc)) |run| {
+        if (!run.rtl) continue;
+        for (try shaper.shape(run)) |cell| try testing.expectEqual(0, cell.x_offset);
+        checked = true;
+    }
+    try testing.expect(checked);
+}
+
+test "shape rtl: lam-alef ligature leaves no gap inside the word" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var testdata = testShaperWithDiscoveredFont(alloc, "Geeza Pro") catch return error.SkipZigTest;
+    defer testdata.deinit();
+
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 10, .rows = 3 });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("\u{0633}\u{0644}\u{0627}\u{0645}");
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    var shaper = &testdata.shaper;
+    var it = shaper.runIterator(.{
+        .grid = testdata.grid,
+        .cells = state.row_data.get(0).cells.slice(),
+    });
+    defer it.deinit(alloc);
+    const run = (try it.next(alloc)).?;
+    try testing.expect(run.rtl);
+    const cells = try shaper.shape(run);
+    try testing.expectEqual(3, cells.len);
+    for (cells, 0..) |cell, i| try testing.expectEqual(i, cell.x);
+}
+
+test "shape rtl: punctuation stays in the run so gaps collect after it" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var testdata = testShaperWithDiscoveredFont(alloc, "Geeza Pro") catch return error.SkipZigTest;
+    defer testdata.deinit();
+
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 10, .rows = 3 });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("\u{0633}\u{0644}\u{0627}\u{0645} \u{0645}.");
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    var shaper = &testdata.shaper;
+    var it = shaper.runIterator(.{
+        .grid = testdata.grid,
+        .cells = state.row_data.get(0).cells.slice(),
+    });
+    defer it.deinit(alloc);
+    const run = (try it.next(alloc)).?;
+    try testing.expect(run.rtl);
+    try testing.expectEqual(7, run.cells);
+
+    // Six glyphs on six consecutive cells: the absorbed cell is at the end.
+    const cells = try shaper.shape(run);
+    try testing.expectEqual(6, cells.len);
+    for (cells, 0..) |cell, i| try testing.expectEqual(i, cell.x);
 }
 
 test "shape nerd fonts" {

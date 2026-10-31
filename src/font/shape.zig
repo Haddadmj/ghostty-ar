@@ -67,6 +67,79 @@ pub const Options = struct {
     features: []const []const u8 = &.{},
 };
 
+/// Close the gaps ligatures leave in a shaped right-to-left run.
+///
+/// A ligature is one glyph covering several cells, so the cells it absorbed
+/// stay empty and open a gap inside the word (or, with a fallback font whose
+/// ligature is narrower than its cells, between letters). Moving each glyph
+/// down by the number of absorbed cells below it collects those empty cells
+/// at the run's logical end, which displays at the left of the RTL text next
+/// to the whitespace that already separates it from what follows.
+///
+/// A cell with no codepoints, such as a wide character's tail, isn't absorbed
+/// and keeps its place. `codepoints` is anything with a `cluster` field.
+pub fn packRtlCells(
+    alloc: std.mem.Allocator,
+    cells: []Cell,
+    codepoints: anytype,
+    run_cells: u16,
+) !void {
+    const has_cp = try alloc.alloc(bool, run_cells);
+    defer alloc.free(has_cp);
+    @memset(has_cp, false);
+    for (codepoints) |cp| {
+        if (cp.cluster < run_cells) has_cp[cp.cluster] = true;
+    }
+
+    const has_glyph = try alloc.alloc(bool, run_cells);
+    defer alloc.free(has_glyph);
+    @memset(has_glyph, false);
+    for (cells) |cell| {
+        if (cell.x < run_cells) has_glyph[cell.x] = true;
+    }
+
+    const shift = try alloc.alloc(u16, run_cells);
+    defer alloc.free(shift);
+    var absorbed: u16 = 0;
+    for (shift, has_cp, has_glyph) |*v, cp, glyph| {
+        v.* = absorbed;
+        if (cp and !glyph) absorbed += 1;
+    }
+
+    for (cells) |*cell| {
+        if (cell.x < run_cells) cell.x -= shift[cell.x];
+    }
+}
+
+test "packRtlCells closes ligature gaps" {
+    const alloc = std.testing.allocator;
+    const Cp = struct { cluster: u32 };
+
+    // Four cells of text, where cell 1 absorbed cell 2.
+    var cells = [_]Cell{
+        .{ .x = 3, .glyph_index = 30 },
+        .{ .x = 1, .glyph_index = 10 },
+        .{ .x = 0, .glyph_index = 0 },
+    };
+    try packRtlCells(alloc, &cells, &[_]Cp{ .{ .cluster = 0 }, .{ .cluster = 1 }, .{ .cluster = 2 }, .{ .cluster = 3 } }, 4);
+    try std.testing.expectEqual(2, cells[0].x);
+    try std.testing.expectEqual(1, cells[1].x);
+    try std.testing.expectEqual(0, cells[2].x);
+}
+
+test "packRtlCells keeps a wide character's tail cell" {
+    const alloc = std.testing.allocator;
+    const Cp = struct { cluster: u32 };
+
+    // A wide glyph in cell 0 with its tail in cell 1, which has no codepoint.
+    var cells = [_]Cell{
+        .{ .x = 2, .glyph_index = 2 },
+        .{ .x = 0, .glyph_index = 0 },
+    };
+    try packRtlCells(alloc, &cells, &[_]Cp{ .{ .cluster = 0 }, .{ .cluster = 2 } }, 3);
+    try std.testing.expectEqual(2, cells[0].x);
+}
+
 /// Options for runIterator.
 pub const RunOptions = struct {
     /// The font state for the terminal screen. This is mutable because

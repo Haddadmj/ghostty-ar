@@ -19,6 +19,7 @@ pub const Metal = @import("renderer/Metal.zig");
 pub const OpenGL = @import("renderer/OpenGL.zig");
 pub const Options = @import("renderer/Options.zig");
 pub const Overlay = @import("renderer/Overlay.zig");
+pub const bidi = @import("renderer/bidi.zig");
 pub const Thread = @import("renderer/Thread.zig");
 pub const State = @import("renderer/State.zig");
 pub const CursorStyle = cursor.Style;
@@ -59,7 +60,7 @@ pub const Health = enum(c_int) {
 test {
     // Our comptime-chosen renderer
     _ = Renderer;
-    _ = @import("renderer/bidi.zig");
+    _ = bidi;
 
     _ = cursor;
     _ = message;

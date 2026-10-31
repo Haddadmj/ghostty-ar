@@ -170,6 +170,7 @@ fn processRows(self: *ShaperRows, comptime mode: Mode) !void {
                 .grid = self.grid,
                 .cells = cells.slice(),
             });
+            defer it.deinit(self.alloc);
             while (try it.next(self.alloc)) |run| switch (mode) {
                 .runs => std.mem.doNotOptimizeAway(run),
                 .shape => std.mem.doNotOptimizeAway(try self.shaper.shape(run)),

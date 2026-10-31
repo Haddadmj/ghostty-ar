@@ -54,6 +54,13 @@ pub const RunIterator = struct {
     bidi_levels: ?[]itijah.BidiLevel = null,
     bidi_checked: bool = false,
 
+    /// Free the row's bidi levels. Callers can stop iterating before the last
+    /// run, so this must always be called with the allocator given to `next`.
+    pub fn deinit(self: *RunIterator, alloc: Allocator) void {
+        if (self.bidi_levels) |levels| alloc.free(levels);
+        self.bidi_levels = null;
+    }
+
     pub fn next(self: *RunIterator, alloc: Allocator) !?TextRun {
         const slice = &self.opts.cells;
         const cells: []const terminal.page.Cell = slice.items(.raw);
@@ -77,12 +84,7 @@ pub const RunIterator = struct {
                 styles[self.i].flags.invisible)) self.i += 1;
 
         // We're over at the max
-        if (self.i >= max) {
-            if (self.bidi_levels) |levels| alloc.free(levels);
-            self.bidi_levels = null;
-            self.bidi_checked = false;
-            return null;
-        }
+        if (self.i >= max) return null;
 
         // Resolve UAX #9 embedding levels for this row on the first call.
         // Pure-LTR rows skip the BiDi pass entirely.
@@ -240,6 +242,21 @@ pub const RunIterator = struct {
                 idx: font.Collection.Index,
                 fallback: ?u32 = null,
             } = font_info: {
+                // Keep whatever the run's font can draw in that font while
+                // the text stays RTL. Arabic usually comes from a fallback
+                // font, and splitting the run at each space or punctuation mark
+                // would leave the ligature gaps from packRtlCells mid-sentence
+                // instead of collecting them at the end of the RTL text.
+                if (j > self.i and !cell.hasGrapheme()) {
+                    if (self.bidi_levels) |levels| {
+                        if (levels[j] & 1 != 0 and self.opts.grid.hasCodepoint(
+                            current_font,
+                            cell.codepoint(),
+                            presentation,
+                        )) break :font_info .{ .idx = current_font };
+                    }
+                }
+
                 // If we find a font that supports this entire grapheme
                 // then we use that.
                 if (try self.indexForCell(

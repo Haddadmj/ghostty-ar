@@ -270,6 +270,13 @@ pub const Shaper = struct {
 
         // RTL shaping yields glyphs in visual order, so cell.x values arrive
         // strictly decreasing. The renderer assumes monotonic-increasing x.
+        if (run.rtl) try font.shape.packRtlCells(
+            self.alloc,
+            self.cell_buf.items,
+            self.codepoints.items,
+            run.cells,
+        );
+
         if (run.rtl) std.mem.sort(
             font.shape.Cell,
             self.cell_buf.items,
@@ -772,6 +779,7 @@ test "shape arabic" {
         .grid = testdata.grid,
         .cells = state.row_data.get(0).cells.slice(),
     });
+    defer it.deinit(alloc);
     var count: usize = 0;
     while (try it.next(alloc)) |run| {
         count += 1;
@@ -816,6 +824,7 @@ test "run iterator: arabic row tags rtl" {
         .grid = testdata.grid,
         .cells = state.row_data.get(0).cells.slice(),
     });
+    defer it.deinit(alloc);
     var count: usize = 0;
     while (try it.next(alloc)) |run| {
         count += 1;
@@ -847,6 +856,7 @@ test "run iterator: mixed latin arabic produces split runs" {
         .grid = testdata.grid,
         .cells = state.row_data.get(0).cells.slice(),
     });
+    defer it.deinit(alloc);
     var count: usize = 0;
     var saw_ltr = false;
     var saw_rtl = false;
@@ -882,6 +892,7 @@ test "run iterator: ltr-only fast path leaves rtl false" {
         .grid = testdata.grid,
         .cells = state.row_data.get(0).cells.slice(),
     });
+    defer it.deinit(alloc);
     var count: usize = 0;
     while (try it.next(alloc)) |run| {
         count += 1;

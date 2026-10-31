@@ -75,6 +75,35 @@ pub fn visualX(
     return map[logical_x];
 }
 
+/// The logical column displayed at a visual column, for mapping the mouse.
+pub const Logical = struct {
+    x: u16,
+
+    /// The cell is displayed right-to-left, so pointer motion within it runs
+    /// opposite to logical order.
+    rtl: bool,
+};
+
+/// Inverse of `visualMap` for a single column. Returns null when the column
+/// isn't reordered: an LTR row, out of range, or the map can't be allocated.
+pub fn logicalX(
+    alloc: Allocator,
+    cells: []const terminal.page.Cell,
+    visual_x: u16,
+    justify: bool,
+) ?Logical {
+    const map = (visualMap(alloc, cells, justify) catch return null) orelse
+        return null;
+    defer alloc.free(map);
+
+    const i = std.mem.indexOfScalar(u16, map, visual_x) orelse return null;
+    return .{
+        .x = @intCast(i),
+        .rtl = (i + 1 < map.len and map[i + 1] + 1 == map[i]) or
+            (i > 0 and map[i - 1] == map[i] + 1),
+    };
+}
+
 fn rowHasRtl(cells: []const terminal.page.Cell) bool {
     for (cells) |cell| {
         const cp: u32 = cell.codepoint();
@@ -193,6 +222,30 @@ test "visualMap: justify leaves ltr-base rows alone" {
     const map = (try visualMap(alloc, row.cells(), true)).?;
     defer alloc.free(map);
     try std.testing.expectEqualSlices(u16, &.{ 0, 1, 2, 3, 4, 5 }, map);
+}
+
+test "logicalX: inverts visualMap and reports direction" {
+    const alloc = std.testing.allocator;
+    const row: *TestRow = try .init(alloc, 8, "ab \u{0645}\u{0631}");
+    defer row.deinit(alloc);
+
+    // Latin keeps its column, the Arabic pair is swapped, blanks are identity.
+    const a = logicalX(alloc, row.cells(), 0, false).?;
+    try std.testing.expectEqual(0, a.x);
+    try std.testing.expect(!a.rtl);
+    const first = logicalX(alloc, row.cells(), 4, false).?;
+    try std.testing.expectEqual(3, first.x);
+    try std.testing.expect(first.rtl);
+    const blank = logicalX(alloc, row.cells(), 7, false).?;
+    try std.testing.expectEqual(7, blank.x);
+    try std.testing.expect(!blank.rtl);
+}
+
+test "logicalX: ltr row has no mapping" {
+    const alloc = std.testing.allocator;
+    const row: *TestRow = try .init(alloc, 8, "abc");
+    defer row.deinit(alloc);
+    try std.testing.expectEqual(null, logicalX(alloc, row.cells(), 1, false));
 }
 
 test "visualX: out of range returns the input" {
