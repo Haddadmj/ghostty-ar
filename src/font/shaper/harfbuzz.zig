@@ -129,6 +129,8 @@ pub const Shaper = struct {
     ///
     /// If there is not enough space in the cell buffer, an error is returned.
     pub fn shape(self: *Shaper, run: font.shape.TextRun) ![]const font.shape.Cell {
+        if (run.rtl) self.hb_buf.setDirection(.rtl);
+
         // We only do shaping if the font is not a special-case. For special-case
         // fonts, the codepoint == glyph_index so we don't need to run any shaping.
         if (run.font_index.special() == null) {
@@ -176,53 +178,63 @@ pub const Shaper = struct {
             // then we need to reset our current cell offsets.
             const cluster = self.codepoints.items[index].cluster;
             if (cell_offset.cluster != cluster) {
-                const is_after_glyph_from_current_or_next_clusters =
-                    cluster <= run_offset.cluster;
-
-                const is_first_codepoint_in_cluster = blk: {
-                    var i = index;
-                    while (i > 0) {
-                        i -= 1;
-                        const codepoint = self.codepoints.items[i];
-                        break :blk codepoint.cluster != cluster;
-                    } else break :blk true;
-                };
-
-                // We need to reset the `cell_offset` at the start of a new
-                // cluster, but we do that conditionally if the codepoint
-                // `is_first_codepoint_in_cluster` and the cluster is not
-                // `is_after_glyph_from_current_or_next_clusters`, which is
-                // a heuristic to detect ligatures and avoid positioning
-                // glyphs that mark ligatures incorrectly. The idea is that
-                // if the first codepoint in a cluster doesn't appear in
-                // the stream, it's very likely that it combined with
-                // codepoints from a previous cluster into a ligature.
-                // Then, the subsequent codepoints are very likely marking
-                // glyphs that are placed relative to that ligature, so if
-                // we were to reset the `cell_offset` to align it with the
-                // grid, the positions would be off. The
-                // `!is_after_glyph_from_current_or_next_clusters` check is
-                // needed in case these marking glyphs come from a later
-                // cluster but are rendered first (see the Chakma and
-                // Bengali tests). In that case when we get to the
-                // codepoint that `is_first_codepoint_in_cluster`, but in a
-                // cluster that
-                // `is_after_glyph_from_current_or_next_clusters`, we don't
-                // want to reset to the grid and cause the positions to be
-                // off. (Note that we could go back and align the cells to
-                // the grid starting from the one from the cluster that
-                // rendered out of order, but that is more complicated so
-                // we don't do that for now. Also, it's TBD if there are
-                // exceptions to this heuristic for detecting ligatures,
-                // but using the logging below seems to show it works
-                // well.)
-                if (is_first_codepoint_in_cluster and
-                    !is_after_glyph_from_current_or_next_clusters)
-                {
+                // RTL runs arrive with strictly decreasing cluster values,
+                // so the LTR ligature heuristic below would never fire and
+                // every new cluster needs a fresh cell anchor.
+                if (run.rtl) {
                     cell_offset = .{
                         .cluster = cluster,
                         .x = run_offset.x,
                     };
+                } else {
+                    const is_after_glyph_from_current_or_next_clusters =
+                        cluster <= run_offset.cluster;
+
+                    const is_first_codepoint_in_cluster = blk: {
+                        var i = index;
+                        while (i > 0) {
+                            i -= 1;
+                            const codepoint = self.codepoints.items[i];
+                            break :blk codepoint.cluster != cluster;
+                        } else break :blk true;
+                    };
+
+                    // We need to reset the `cell_offset` at the start of a new
+                    // cluster, but we do that conditionally if the codepoint
+                    // `is_first_codepoint_in_cluster` and the cluster is not
+                    // `is_after_glyph_from_current_or_next_clusters`, which is
+                    // a heuristic to detect ligatures and avoid positioning
+                    // glyphs that mark ligatures incorrectly. The idea is that
+                    // if the first codepoint in a cluster doesn't appear in
+                    // the stream, it's very likely that it combined with
+                    // codepoints from a previous cluster into a ligature.
+                    // Then, the subsequent codepoints are very likely marking
+                    // glyphs that are placed relative to that ligature, so if
+                    // we were to reset the `cell_offset` to align it with the
+                    // grid, the positions would be off. The
+                    // `!is_after_glyph_from_current_or_next_clusters` check is
+                    // needed in case these marking glyphs come from a later
+                    // cluster but are rendered first (see the Chakma and
+                    // Bengali tests). In that case when we get to the
+                    // codepoint that `is_first_codepoint_in_cluster`, but in a
+                    // cluster that
+                    // `is_after_glyph_from_current_or_next_clusters`, we don't
+                    // want to reset to the grid and cause the positions to be
+                    // off. (Note that we could go back and align the cells to
+                    // the grid starting from the one from the cluster that
+                    // rendered out of order, but that is more complicated so
+                    // we don't do that for now. Also, it's TBD if there are
+                    // exceptions to this heuristic for detecting ligatures,
+                    // but using the logging below seems to show it works
+                    // well.)
+                    if (is_first_codepoint_in_cluster and
+                        !is_after_glyph_from_current_or_next_clusters)
+                    {
+                        cell_offset = .{
+                            .cluster = cluster,
+                            .x = run_offset.x,
+                        };
+                    }
                 }
             }
 
@@ -256,7 +268,20 @@ pub const Shaper = struct {
         }
         //log.warn("----------------", .{});
 
+        // RTL shaping yields glyphs in visual order, so cell.x values arrive
+        // strictly decreasing. The renderer assumes monotonic-increasing x.
+        if (run.rtl) std.mem.sort(
+            font.shape.Cell,
+            self.cell_buf.items,
+            {},
+            cellLessThanByX,
+        );
+
         return self.cell_buf.items;
+    }
+
+    fn cellLessThanByX(_: void, a: font.shape.Cell, b: font.shape.Cell) bool {
+        return a.x < b.x;
     }
 
     /// The hooks for RunIterator.
@@ -275,9 +300,10 @@ pub const Shaper = struct {
 
             self.shaper.codepoints.clearRetainingCapacity();
 
-            // We don't support RTL text because RTL in terminals is messy.
-            // Its something we want to improve. For now, we force LTR because
-            // our renderers assume a strictly increasing X value.
+            // Default to LTR; `Shaper.shape` overrides to RTL when the run
+            // resolves right-to-left under UAX #9. Setting it here also
+            // pins the direction so `guessSegmentProperties` does not
+            // auto-detect a different one.
             self.shaper.hb_buf.setDirection(.ltr);
         }
 
@@ -722,11 +748,7 @@ test "shape monaspace ligs" {
     }
 }
 
-// Ghostty doesn't currently support RTL and our renderers assume
-// that cells are in strict LTR order. This means that we need to
-// force RTL text to be LTR for rendering. This test ensures that
-// we are correctly forcing RTL text to be LTR.
-test "shape arabic forced LTR" {
+test "shape arabic" {
     const testing = std.testing;
     const alloc = testing.allocator;
     const io = testing.io;
@@ -753,16 +775,117 @@ test "shape arabic forced LTR" {
     var count: usize = 0;
     while (try it.next(alloc)) |run| {
         count += 1;
+        try testing.expect(run.rtl);
         try testing.expectEqual(@as(usize, 25), run.cells);
 
         const cells = try shaper.shape(run);
-        try testing.expectEqual(@as(usize, 25), cells.len);
+        // Glyph count may be less than cell count when the font collapses
+        // mandatory ligatures like lam-alef.
+        try testing.expect(cells.len <= run.cells);
 
+        // The renderer requires strictly non-decreasing x.
         var x: u16 = cells[0].x;
         for (cells[1..]) |cell| {
-            try testing.expectEqual(x + 1, cell.x);
+            try testing.expect(cell.x >= x);
             x = cell.x;
         }
+    }
+    try testing.expectEqual(@as(usize, 1), count);
+}
+
+test "run iterator: arabic row tags rtl" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var testdata = try testShaperWithFont(alloc, .arabic);
+    defer testdata.deinit();
+
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 30, .rows = 3 });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("\u{0645}\u{0631}\u{062D}\u{0628}\u{0627}");
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    var shaper = &testdata.shaper;
+    var it = shaper.runIterator(.{
+        .grid = testdata.grid,
+        .cells = state.row_data.get(0).cells.slice(),
+    });
+    var count: usize = 0;
+    while (try it.next(alloc)) |run| {
+        count += 1;
+        try testing.expect(run.rtl);
+    }
+    try testing.expectEqual(@as(usize, 1), count);
+}
+
+test "run iterator: mixed latin arabic produces split runs" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var testdata = try testShaperWithFont(alloc, .arabic);
+    defer testdata.deinit();
+
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 30, .rows = 3 });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("Hi \u{0645}\u{0631}\u{062D}\u{0628}\u{0627}");
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    var shaper = &testdata.shaper;
+    var it = shaper.runIterator(.{
+        .grid = testdata.grid,
+        .cells = state.row_data.get(0).cells.slice(),
+    });
+    var count: usize = 0;
+    var saw_ltr = false;
+    var saw_rtl = false;
+    while (try it.next(alloc)) |run| {
+        count += 1;
+        if (run.rtl) saw_rtl = true else saw_ltr = true;
+    }
+    try testing.expect(count >= 2);
+    try testing.expect(saw_ltr);
+    try testing.expect(saw_rtl);
+}
+
+test "run iterator: ltr-only fast path leaves rtl false" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var testdata = try testShaper(alloc);
+    defer testdata.deinit();
+
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 10, .rows = 3 });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("ABCD");
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    var shaper = &testdata.shaper;
+    var it = shaper.runIterator(.{
+        .grid = testdata.grid,
+        .cells = state.row_data.get(0).cells.slice(),
+    });
+    var count: usize = 0;
+    while (try it.next(alloc)) |run| {
+        count += 1;
+        try testing.expect(!run.rtl);
     }
     try testing.expectEqual(@as(usize, 1), count);
 }

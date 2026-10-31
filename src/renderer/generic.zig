@@ -12,6 +12,7 @@ const terminal = @import("../terminal/main.zig");
 const renderer = @import("../renderer.zig");
 const math = @import("../math.zig");
 const Surface = @import("../Surface.zig");
+const bidi = @import("bidi.zig");
 const link = @import("link.zig");
 const cellpkg = @import("cell.zig");
 const noMinContrast = cellpkg.noMinContrast;
@@ -623,6 +624,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             background_blur: configpkg.Config.BackgroundBlur,
             scroll_to_bottom_on_output: bool,
             custom_shader_animation: configpkg.CustomShaderAnimation,
+            rtl_justify: bool,
 
             pub fn init(
                 alloc_gpa: Allocator,
@@ -662,6 +664,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .background_opacity_cells = config.@"background-opacity-cells",
                     .font_thicken = config.@"font-thicken",
                     .font_thicken_strength = config.@"font-thicken-strength",
+                    .rtl_justify = config.@"rtl-justify",
                     .font_features = font_features.list,
                     .font_styles = font_styles,
                     .font_shaping_break = config.@"font-shaping-break",
@@ -2825,10 +2828,23 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     break :cursor_color state.colors.foreground;
                 };
 
+                // The column the cursor is drawn at. If we're on the tail of
+                // a wide character, the cursor covers the whole character.
+                const cursor_visual_x: u16 = visual: {
+                    const raw = row_cells[cursor_vp.y].slice().items(.raw);
+                    break :visual bidi.visualX(
+                        self.alloc,
+                        raw[0..@min(raw.len, self.cells.size.columns)],
+                        if (cursor_vp.wide_tail) cursor_vp.x -| 1 else cursor_vp.x,
+                        self.config.rtl_justify,
+                    );
+                };
+
                 self.addCursor(
                     &state.cursor,
                     style,
                     cursor_color,
+                    cursor_visual_x,
                 );
 
                 // If the cursor is visible then we set our uniforms.
@@ -2836,13 +2852,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     const wide = state.cursor.cell.wide;
 
                     self.uniforms.cursor_pos = .{
-                        // If we are a spacer tail of a wide cell, our cursor needs
-                        // to move back one cell. The saturate is to ensure we don't
-                        // overflow but this shouldn't happen with well-formed input.
-                        switch (wide) {
-                            .narrow, .spacer_head, .wide => cursor_vp.x,
-                            .spacer_tail => cursor_vp.x -| 1,
-                        },
+                        cursor_visual_x,
                         @intCast(cursor_vp.y),
                     };
 
@@ -2990,11 +3000,22 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             var shaper_cells: ?[]const font.shape.Cell = null;
             var shaper_cells_i: usize = 0;
 
+            // Logical-to-visual map for the row. Null on LTR rows so the hot
+            // loop skips the lookup. A failure only costs this row its reorder.
+            const log_to_vis: ?[]u16 = bidi.visualMap(
+                self.alloc,
+                cells_raw[0..cells_len],
+                self.config.rtl_justify,
+            ) catch null;
+            defer if (log_to_vis) |m| self.alloc.free(m);
+
             for (
                 0..,
                 cells_raw[0..cells_len],
                 cells_style[0..cells_len],
             ) |x, *cell, *managed_style| {
+                const visual_x: u16 = if (log_to_vis) |m| m[x] else @intCast(x);
+
                 // If this cell falls within our preedit range then we
                 // skip this because preedits are setup separately.
                 if (preedit_range) |range| preedit: {
@@ -3225,7 +3246,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         break :bg_alpha 0;
                     };
 
-                    self.cells.bgCell(y, x).* = .{
+                    self.cells.bgCell(y, visual_x).* = .{
                         rgb.r, rgb.g, rgb.b, bg_alpha,
                     };
                 }
@@ -3262,7 +3283,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // This improves readability when a colored underline is used
                 // which intersects parts of the text (descenders).
                 if (underline != .none) self.addUnderline(
-                    @intCast(x),
+                    @intCast(visual_x),
                     @intCast(y),
                     underline,
                     style.underlineColor(&state.colors.palette) orelse fg,
@@ -3270,11 +3291,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 ) catch |err| {
                     log.warn(
                         "error adding underline to cell, will be invalid x={} y={}, err={}",
-                        .{ x, y, err },
+                        .{ visual_x, y, err },
                     );
                 };
 
-                if (style.flags.overline) self.addOverline(@intCast(x), @intCast(y), fg, alpha) catch |err| {
+                if (style.flags.overline) self.addOverline(@intCast(visual_x), @intCast(y), fg, alpha) catch |err| {
                     log.warn(
                         "error adding overline to cell, will be invalid x={} y={}, err={}",
                         .{ x, y, err },
@@ -3339,6 +3360,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     }) {
                         self.addGlyph(
                             @intCast(x),
+                            @intCast(visual_x),
                             @intCast(y),
                             state.cols,
                             cells_raw,
@@ -3349,7 +3371,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         ) catch |err| {
                             log.warn(
                                 "error adding glyph to cell, will be invalid x={} y={}, err={}",
-                                .{ x, y, err },
+                                .{ visual_x, y, err },
                             );
                         };
                     }
@@ -3357,7 +3379,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 // Finally, draw a strikethrough if necessary.
                 if (style.flags.strikethrough) self.addStrikethrough(
-                    @intCast(x),
+                    @intCast(visual_x),
                     @intCast(y),
                     fg,
                     alpha,
@@ -3477,6 +3499,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         fn addGlyph(
             self: *Self,
             x: terminal.size.CellCountInt,
+            visual_x: terminal.size.CellCountInt,
             y: terminal.size.CellCountInt,
             cols: usize,
             cell_raws: []const terminal.page.Cell,
@@ -3525,7 +3548,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .text => .grayscale,
                 },
                 .bools = .{ .no_min_contrast = noMinContrast(cp) },
-                .grid_pos = .{ @intCast(x), @intCast(y) },
+                .grid_pos = .{ @intCast(visual_x), @intCast(y) },
                 .color = .{ color.r, color.g, color.b, alpha },
                 .glyph_pos = .{ render.glyph.atlas_x, render.glyph.atlas_y },
                 .glyph_size = .{ render.glyph.width, render.glyph.height },
@@ -3541,22 +3564,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             cursor_state: *const terminal.RenderState.Cursor,
             cursor_style: renderer.CursorStyle,
             cursor_color: terminal.color.RGB,
+            x: u16,
         ) void {
             const cursor_vp = cursor_state.viewport orelse return;
 
-            // Add the cursor. We render the cursor over the wide character if
-            // we're on the wide character tail.
-            const wide, const x = cell: {
-                // The cursor goes over the screen cursor position.
-                if (!cursor_vp.wide_tail) break :cell .{
-                    cursor_state.cell.wide == .wide,
-                    cursor_vp.x,
-                };
-
-                // If we're part of a wide character, we move the cursor back
-                // to the actual character.
-                break :cell .{ true, cursor_vp.x - 1 };
-            };
+            // We render the cursor over the wide character if we're on the
+            // wide character tail.
+            const wide = cursor_vp.wide_tail or cursor_state.cell.wide == .wide;
 
             const alpha: u8 = if (!self.focused) 255 else alpha: {
                 const alpha = 255 * self.config.cursor_opacity;

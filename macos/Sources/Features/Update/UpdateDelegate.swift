@@ -3,17 +3,11 @@ import Cocoa
 
 extension UpdateDriver: SPUUpdaterDelegate {
     func feedURLString(for updater: SPUUpdater) -> String? {
-        guard let appDelegate = NSApplication.shared.delegate as? AppDelegate else {
-            return nil
-        }
-
-        // Sparkle supports a native concept of "channels" but it requires that
-        // you share a single appcast file. We don't want to do that so we
-        // do this instead.
-        switch appDelegate.ghostty.config.autoUpdateChannel {
-        case .tip: return "https://tip.files.ghostty.org/appcast.xml"
-        case .stable: return "https://release.files.ghostty.org/appcast.xml"
-        }
+        // ghostty-ar: never use upstream's appcast. Its updates are signed with
+        // the key in Info.plist, so Sparkle would accept one and replace this
+        // build with stock Ghostty, removing bidi. This fork publishes no
+        // appcast, so a manual check just reports that it found nothing.
+        return "https://github.com/Haddadmj/ghostty-ar/releases/latest/download/appcast.xml"
     }
 
     /// Called when an update is scheduled to install silently,

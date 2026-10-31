@@ -56,6 +56,9 @@ pub const Shaper = struct {
     /// The values in this never change so we can avoid overhead
     /// by just creating it once and saving it for reuse.
     typesetter_attr_dict: *macos.foundation.Dictionary,
+    /// Same as `typesetter_attr_dict` but with embedding level 1, used
+    /// when shaping a run flagged `rtl`.
+    typesetter_attr_dict_rtl: *macos.foundation.Dictionary,
 
     /// List where we cache fonts, so we don't have to remake them for
     /// every single shaping operation.
@@ -173,25 +176,18 @@ pub const Shaper = struct {
         var run_state = RunState.init();
         errdefer run_state.deinit(alloc);
 
-        // For now we only support LTR text. If we shape RTL text then
-        // rendering will be very wrong so we need to explicitly force
-        // LTR no matter what.
+        // We pin the CTTypesetter's BiDi behavior with
+        // kCTTypesetterOptionForcedEmbeddingLevel. The run iterator already
+        // splits each run into a single direction under UAX #9, so each
+        // run shapes with embedding level 0 (LTR) or 1 (RTL).
+        //
+        // Setting the writing direction on the attributed string instead
+        // produces wrong line breaks (a trailing space at the end of an
+        // RTL line emits as its own run with the "right to left" flag,
+        // ahead of the rest of the line).
         //
         // See: https://github.com/mitchellh/ghostty/issues/1737
         // See: https://github.com/mitchellh/ghostty/issues/1442
-        //
-        // We used to do this by setting the writing direction attribute
-        // on the attributed string we used, but it seems like that will
-        // still allow some weird results, for example a single space at
-        // the end of a line composed of RTL characters will be cause it
-        // to output a run containing just that space, BEFORE it outputs
-        // the rest of the line as a separate run, very weirdly with the
-        // "right to left" flag set in the single space run's run status...
-        //
-        // So instead what we do is use a CTTypesetter to create our line,
-        // using the kCTTypesetterOptionForcedEmbeddingLevel attribute to
-        // force CoreText not to try doing any sort of BiDi, instead just
-        // treat all text as embedding level 0 (left to right).
         const typesetter_attr_dict = dict: {
             const num = try macos.foundation.Number.create(.int, &0);
             defer num.release();
@@ -201,6 +197,16 @@ pub const Shaper = struct {
             );
         };
         errdefer typesetter_attr_dict.release();
+
+        const typesetter_attr_dict_rtl = dict: {
+            const num = try macos.foundation.Number.create(.int, &@as(c_int, 1));
+            defer num.release();
+            break :dict try macos.foundation.Dictionary.create(
+                &.{macos.c.kCTTypesetterOptionForcedEmbeddingLevel},
+                &.{num},
+            );
+        };
+        errdefer typesetter_attr_dict_rtl.release();
 
         // Create the CF release thread.
         var cf_release_thread = try alloc.create(CFReleaseThread);
@@ -223,6 +229,7 @@ pub const Shaper = struct {
             .features = features,
             .features_no_default = features_no_default,
             .typesetter_attr_dict = typesetter_attr_dict,
+            .typesetter_attr_dict_rtl = typesetter_attr_dict_rtl,
             .cached_fonts = .empty,
             .cached_font_grid = 0,
             .cf_release_pool = .empty,
@@ -237,6 +244,7 @@ pub const Shaper = struct {
         self.features.release();
         self.features_no_default.release();
         self.typesetter_attr_dict.release();
+        self.typesetter_attr_dict_rtl.release();
 
         {
             for (self.cached_fonts.items) |ft| {
@@ -371,12 +379,16 @@ pub const Shaper = struct {
         );
         self.cf_release_pool.appendAssumeCapacity(attr_str);
 
-        // Create a typesetter from the attributed string and the cached
-        // attr dict. (See comment in init for more info on the attr dict.)
+        // Create a typesetter from the attributed string. The RTL embedding
+        // dict is picked when the run iterator resolved this run as RTL.
+        const ts_dict = if (run.rtl)
+            self.typesetter_attr_dict_rtl
+        else
+            self.typesetter_attr_dict;
         const typesetter =
             try macos.text.Typesetter.createWithAttributedStringAndOptions(
                 attr_str,
-                self.typesetter_attr_dict,
+                ts_dict,
             );
         self.cf_release_pool.appendAssumeCapacity(typesetter);
 
@@ -413,6 +425,7 @@ pub const Shaper = struct {
         // other so we can iterate over them and just append to our
         // cell buffer.
         const runs = line.getGlyphRuns();
+
         for (0..runs.getCount()) |run_i| {
             const ctrun = runs.getValueAtIndex(macos.text.Run, run_i);
 
@@ -438,64 +451,75 @@ pub const Shaper = struct {
                 // then we need to reset our current cell offsets.
                 const cluster = state.codepoints.items[index].cluster;
                 if (cell_offset.cluster != cluster) {
-                    // We previously asserted that the new cluster is greater
-                    // than cell_offset.cluster, but this isn't always true.
-                    // See e.g. the "shape Chakma vowel sign with ligature
-                    // (vowel sign renders first)" test.
-
-                    const is_after_glyph_from_current_or_next_clusters =
-                        cluster <= run_offset.cluster;
-
-                    const is_first_codepoint_in_cluster = blk: {
-                        var i = index;
-                        while (i > 0) {
-                            i -= 1;
-                            const codepoint = state.codepoints.items[i];
-
-                            // Skip surrogate pair padding
-                            if (codepoint.codepoint == 0) continue;
-                            break :blk codepoint.cluster != cluster;
-                        } else break :blk true;
-                    };
-
-                    // We need to reset the `cell_offset` at the start of a new
-                    // cluster, but we do that conditionally if the codepoint
-                    // `is_first_codepoint_in_cluster` and the cluster is not
-                    // `is_after_glyph_from_current_or_next_clusters`, which is
-                    // a heuristic to detect ligatures and avoid positioning
-                    // glyphs that mark ligatures incorrectly. The idea is that
-                    // if the first codepoint in a cluster doesn't appear in
-                    // the stream, it's very likely that it combined with
-                    // codepoints from a previous cluster into a ligature.
-                    // Then, the subsequent codepoints are very likely marking
-                    // glyphs that are placed relative to that ligature, so if
-                    // we were to reset the `cell_offset` to align it with the
-                    // grid, the positions would be off. The
-                    // `!is_after_glyph_from_current_or_next_clusters` check is
-                    // needed in case these marking glyphs come from a later
-                    // cluster but are rendered first (see the Chakma and
-                    // Bengali tests). In that case when we get to the
-                    // codepoint that `is_first_codepoint_in_cluster`, but in a
-                    // cluster that
-                    // `is_after_glyph_from_current_or_next_clusters`, we don't
-                    // want to reset to the grid and cause the positions to be
-                    // off. (Note that we could go back and align the cells to
-                    // the grid starting from the one from the cluster that
-                    // rendered out of order, but that is more complicated so
-                    // we don't do that for now. Also, it's TBD if there are
-                    // exceptions to this heuristic for detecting ligatures,
-                    // but using the logging below seems to show it works
-                    // well.)
-                    if (is_first_codepoint_in_cluster and
-                        !is_after_glyph_from_current_or_next_clusters)
-                    {
+                    // RTL runs arrive with strictly decreasing cluster
+                    // values, so the LTR ligature heuristic below would
+                    // never fire and every new cluster needs a fresh
+                    // cell anchor.
+                    if (run.rtl) {
                         cell_offset = .{
                             .cluster = cluster,
                             .x = run_offset.x,
                         };
+                    } else {
+                        // We previously asserted that the new cluster is greater
+                        // than cell_offset.cluster, but this isn't always true.
+                        // See e.g. the "shape Chakma vowel sign with ligature
+                        // (vowel sign renders first)" test.
 
-                        // For debugging positions, turn this on:
-                        //cell_offset_y = run_offset_y;
+                        const is_after_glyph_from_current_or_next_clusters =
+                            cluster <= run_offset.cluster;
+
+                        const is_first_codepoint_in_cluster = blk: {
+                            var i = index;
+                            while (i > 0) {
+                                i -= 1;
+                                const codepoint = state.codepoints.items[i];
+
+                                // Skip surrogate pair padding
+                                if (codepoint.codepoint == 0) continue;
+                                break :blk codepoint.cluster != cluster;
+                            } else break :blk true;
+                        };
+
+                        // We need to reset the `cell_offset` at the start of a new
+                        // cluster, but we do that conditionally if the codepoint
+                        // `is_first_codepoint_in_cluster` and the cluster is not
+                        // `is_after_glyph_from_current_or_next_clusters`, which is
+                        // a heuristic to detect ligatures and avoid positioning
+                        // glyphs that mark ligatures incorrectly. The idea is that
+                        // if the first codepoint in a cluster doesn't appear in
+                        // the stream, it's very likely that it combined with
+                        // codepoints from a previous cluster into a ligature.
+                        // Then, the subsequent codepoints are very likely marking
+                        // glyphs that are placed relative to that ligature, so if
+                        // we were to reset the `cell_offset` to align it with the
+                        // grid, the positions would be off. The
+                        // `!is_after_glyph_from_current_or_next_clusters` check is
+                        // needed in case these marking glyphs come from a later
+                        // cluster but are rendered first (see the Chakma and
+                        // Bengali tests). In that case when we get to the
+                        // codepoint that `is_first_codepoint_in_cluster`, but in a
+                        // cluster that
+                        // `is_after_glyph_from_current_or_next_clusters`, we don't
+                        // want to reset to the grid and cause the positions to be
+                        // off. (Note that we could go back and align the cells to
+                        // the grid starting from the one from the cluster that
+                        // rendered out of order, but that is more complicated so
+                        // we don't do that for now. Also, it's TBD if there are
+                        // exceptions to this heuristic for detecting ligatures,
+                        // but using the logging below seems to show it works
+                        // well.)
+                        if (is_first_codepoint_in_cluster and
+                            !is_after_glyph_from_current_or_next_clusters)
+                        {
+                            cell_offset = .{
+                                .cluster = cluster,
+                                .x = run_offset.x,
+                            };
+
+                            // For debugging positions, turn this on:
+                            //cell_offset_y = run_offset_y;
+                        }
                     }
                 }
 
@@ -521,24 +545,18 @@ pub const Shaper = struct {
             }
         }
 
-        // If our buffer contains some non-ltr sections we need to sort it :/
-        if (non_ltr) {
-            // This is EXCEPTIONALLY rare. Only happens for languages with
-            // complex shaping which we don't even really support properly
-            // right now, so are very unlikely to be used heavily by users
-            // of Ghostty.
-            @branchHint(.cold);
-            std.mem.sort(
-                font.shape.Cell,
-                self.cell_buf.items,
-                {},
-                struct {
-                    fn lt(_: void, a: font.shape.Cell, b: font.shape.Cell) bool {
-                        return a.x < b.x;
-                    }
-                }.lt,
-            );
-        }
+        // The renderer assumes monotonic-increasing x. RTL runs and
+        // non-monotonic LTR runs both need a sort to get there.
+        if (non_ltr) std.mem.sort(
+            font.shape.Cell,
+            self.cell_buf.items,
+            {},
+            struct {
+                fn lt(_: void, a: font.shape.Cell, b: font.shape.Cell) bool {
+                    return a.x < b.x;
+                }
+            }.lt,
+        );
 
         return self.cell_buf.items;
     }

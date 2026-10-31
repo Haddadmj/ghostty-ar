@@ -1481,6 +1481,19 @@ link: RepeatableLink = .{},
 /// Available since: 1.4.0
 @"link-osc8": bool = true,
 
+/// Right-justify rows whose UAX #9 base direction resolves to right-to-left.
+///
+/// When enabled, a row whose first strong directional character is RTL
+/// (Arabic, Hebrew, etc.) is rendered with its content pushed to the right
+/// edge of the terminal, matching how a native Arabic or Hebrew reader
+/// expects the line to align. LTR-base rows are unaffected.
+///
+/// This is opt-in because Ghostty enforces strict monospace and shifting
+/// rows can interact unexpectedly with applications that draw to specific
+/// columns. Pure-RTL output (e.g. `cat arabic-text.txt`) benefits the
+/// most.
+@"rtl-justify": bool = false,
+
 /// Show link previews for a matched URL.
 ///
 /// When true, link previews are shown for all matched URLs. When false, link
@@ -4947,6 +4960,9 @@ pub fn finalize(self: *Config) !void {
     if (self.@"auto-update-channel" == null) {
         self.@"auto-update-channel" = build_config.release_channel;
     }
+
+    // ghostty-ar: this fork has no update feed, so don't check by default.
+    if (self.@"auto-update" == null) self.@"auto-update" = .off;
 
     self.@"faint-opacity" = std.math.clamp(self.@"faint-opacity", 0.0, 1.0);
 

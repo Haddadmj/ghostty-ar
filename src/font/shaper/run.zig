@@ -4,6 +4,7 @@ const Allocator = std.mem.Allocator;
 const font = @import("../main.zig");
 const shape = @import("../shape.zig");
 const terminal = @import("../../terminal/main.zig");
+const itijah = @import("itijah");
 const autoHash = std.hash.autoHash;
 const Hasher = std.hash.Wyhash;
 
@@ -36,6 +37,9 @@ pub const TextRun = struct {
 
     /// The font index to use for the glyphs of this run.
     font_index: font.Collection.Index,
+
+    /// True when this run resolves to right-to-left under UAX #9.
+    rtl: bool = false,
 };
 
 /// RunIterator is an iterator that yields text runs.
@@ -43,6 +47,12 @@ pub const RunIterator = struct {
     hooks: font.Shaper.RunIteratorHook,
     opts: shape.RunOptions,
     i: usize = 0,
+
+    /// Per-row UAX #9 embedding levels for cells[0..max]. Stays null when
+    /// the row contains no strong-RTL codepoints, keeping the LTR path
+    /// allocation-free.
+    bidi_levels: ?[]itijah.BidiLevel = null,
+    bidi_checked: bool = false,
 
     pub fn next(self: *RunIterator, alloc: Allocator) !?TextRun {
         const slice = &self.opts.cells;
@@ -67,7 +77,16 @@ pub const RunIterator = struct {
                 styles[self.i].flags.invisible)) self.i += 1;
 
         // We're over at the max
-        if (self.i >= max) return null;
+        if (self.i >= max) {
+            if (self.bidi_levels) |levels| alloc.free(levels);
+            self.bidi_levels = null;
+            self.bidi_checked = false;
+            return null;
+        }
+
+        // Resolve UAX #9 embedding levels for this row on the first call.
+        // Pure-LTR rows skip the BiDi pass entirely.
+        try self.ensureBidi(alloc, cells, max);
 
         // Track the font for our current run
         var current_font: font.Collection.Index = .{};
@@ -104,6 +123,11 @@ pub const RunIterator = struct {
             switch (cell.wide) {
                 .narrow, .wide => {},
                 .spacer_head, .spacer_tail => continue,
+            }
+
+            // Break the run when the BiDi embedding level changes.
+            if (self.bidi_levels) |levels| {
+                if (j > self.i and levels[j] != levels[self.i]) break;
             }
 
             // If our cell attributes are changing, then we split the run.
@@ -294,13 +318,65 @@ pub const RunIterator = struct {
         // Move our cursor. Must defer since we use self.i below.
         defer self.i = j;
 
+        const rtl = if (self.bidi_levels) |levels|
+            (levels[self.i] & 1) != 0
+        else
+            false;
+
+        // Direction changes shaping (mirrored brackets, cluster order), so
+        // the same text in each direction must not share a cache entry.
+        autoHash(&hasher, rtl);
+
         return .{
             .hash = hasher.final(),
             .offset = @intCast(self.i),
             .cells = @intCast(j - self.i),
             .grid = self.opts.grid,
             .font_index = current_font,
+            .rtl = rtl,
         };
+    }
+
+    /// Resolve UAX #9 embedding levels for the row, or leave them null
+    /// if the row contains no strong-RTL codepoints (LTR fast path).
+    fn ensureBidi(
+        self: *RunIterator,
+        alloc: Allocator,
+        cells: []const terminal.page.Cell,
+        max: usize,
+    ) !void {
+        if (self.bidi_checked) return;
+        self.bidi_checked = true;
+
+        // Fast path: if no cell carries a strong-RTL class, leave
+        // `bidi_levels` null so the hot loop skips the level check.
+        var has_rtl = false;
+        for (cells[0..max]) |cell| {
+            const cp: u32 = cell.codepoint();
+            if (cp == 0) continue;
+            if (itijah.unicode.isRtlStrong(itijah.unicode.bidiClass(@intCast(cp)))) {
+                has_rtl = true;
+                break;
+            }
+        }
+        if (!has_rtl) return;
+
+        // Build a codepoint sequence for the row. Empty cells are mapped to
+        // U+0020 so paragraph-direction detection treats them as neutral
+        // whitespace rather than U+0000 boundary neutrals.
+        const cps = try alloc.alloc(u21, max);
+        defer alloc.free(cps);
+        for (cells[0..max], 0..) |cell, idx| {
+            const cp: u32 = cell.codepoint();
+            cps[idx] = if (cp == 0) ' ' else @intCast(cp);
+        }
+
+        // First strong character sets the base direction. This must match
+        // renderer/bidi.zig, which reorders the row using the same rule.
+        var dir: itijah.ParDirection = .auto_ltr;
+        const emb = try itijah.getParEmbeddingLevels(alloc, cps, &dir);
+        // Only `levels` is heap-allocated; we retain it directly.
+        self.bidi_levels = emb.levels;
     }
 
     fn addCodepoint(self: *RunIterator, hasher: anytype, cp: u32, cluster: u32) !void {
