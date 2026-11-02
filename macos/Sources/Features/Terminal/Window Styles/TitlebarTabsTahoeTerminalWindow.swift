@@ -9,6 +9,22 @@ class TitlebarTabsTahoeTerminalWindow: TransparentTitlebarTerminalWindow, NSTool
     /// The view model for SwiftUI views
     private var viewModel = ViewModel()
 
+    /// How far the traffic lights, tabs and title sit below AppKit's default position, to free
+    /// up the top of the titlebar for dragging the window.
+    private static let titlebarContentShift: CGFloat = 6
+
+    /// Keeps the tabs clear of the traffic lights, updated as the window enters and exits fullscreen.
+    private var tabBarLeftConstraint: NSLayoutConstraint?
+
+    /// The traffic lights aren't in the tab bar's row in fullscreen, so the tabs can use the full width.
+    private var tabBarLeftPadding: CGFloat {
+        guard !styleMask.contains(.fullScreen) else { return 0 }
+        return switch derivedConfig.macosWindowButtons {
+        case .hidden: 0
+        case .visible: 88
+        }
+    }
+
     /// Titlebar tabs can't support the update accessory because of the way we layout
     /// the native tabs back into the menu bar.
     override var supportsUpdateAccessory: Bool { false }
@@ -18,6 +34,29 @@ class TitlebarTabsTahoeTerminalWindow: TransparentTitlebarTerminalWindow, NSTool
     }
 
     // MARK: NSWindow
+
+    override func layoutIfNeeded() {
+        super.layoutIfNeeded()
+        positionWindowButtons()
+
+        if let tabBarLeftConstraint, tabBarLeftConstraint.constant != tabBarLeftPadding {
+            tabBarLeftConstraint.constant = tabBarLeftPadding
+        }
+    }
+
+    /// AppKit resets the traffic lights on layout, so this has to be reapplied each time.
+    private func positionWindowButtons() {
+        // Fullscreen shows them in a separate toolbar window that we leave alone.
+        guard !styleMask.contains(.fullScreen) else { return }
+
+        let centerFromTop = 26 + Self.titlebarContentShift
+        for type in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
+            guard let button = standardWindowButton(type), let superview = button.superview else { continue }
+            let center = superview.convert(NSPoint(x: 0, y: frame.height - centerFromTop), from: nil)
+            let y = center.y - button.frame.height / 2
+            if abs(button.frame.origin.y - y) > 0.5 { button.setFrameOrigin(NSPoint(x: button.frame.origin.x, y: y)) }
+        }
+    }
 
     override var titlebarFont: NSFont? {
         didSet {
@@ -49,7 +88,7 @@ class TitlebarTabsTahoeTerminalWindow: TransparentTitlebarTerminalWindow, NSTool
         toolbar.delegate = self
         toolbar.centeredItemIdentifiers.insert(.title)
         self.toolbar = toolbar
-        toolbarStyle = .unifiedCompact
+        toolbarStyle = .unified
     }
     // Called after new tab finishes adjusting and setupTabBar is called in order to prevent Tab Bar hiding/size bug that occurs with some interactions with Mac UI
     override func syncAppearance(_ surfaceConfig: Ghostty.SurfaceView.DerivedConfig) {
@@ -177,23 +216,22 @@ class TitlebarTabsTahoeTerminalWindow: TransparentTitlebarTerminalWindow, NSTool
         // The container is the view that we'll constrain our tab bar within.
         let container = toolbarView
 
-        // The padding for the tab bar. If we're showing window buttons then
-        // we need to offset the window buttons.
-        let leftPadding: CGFloat = switch self.derivedConfig.macosWindowButtons {
-        case .hidden: 0
-        case .visible: 70
-        }
-
         // Constrain the accessory clip view (the parent of the accessory view
         // usually that clips the children) to the container view.
         clipView.translatesAutoresizingMaskIntoConstraints = false
         accessoryView.translatesAutoresizingMaskIntoConstraints = false
 
+        // Replace rather than stack this one: its constant changes, so an old copy would conflict.
+        tabBarLeftConstraint?.isActive = false
+        let leftConstraint = clipView.leftAnchor.constraint(equalTo: container.leftAnchor, constant: tabBarLeftPadding)
+        tabBarLeftConstraint = leftConstraint
+
         // Setup all our constraints
         NSLayoutConstraint.activate([
-            clipView.leftAnchor.constraint(equalTo: container.leftAnchor, constant: leftPadding),
+            leftConstraint,
             clipView.rightAnchor.constraint(equalTo: container.rightAnchor),
-            clipView.topAnchor.constraint(equalTo: container.topAnchor, constant: 2),
+            // AppKit lays the tabs out low in the taller .unified toolbar; -18 lines them up with AppKit's traffic lights.
+            clipView.topAnchor.constraint(equalTo: container.topAnchor, constant: -18 + Self.titlebarContentShift),
             clipView.heightAnchor.constraint(equalTo: container.heightAnchor),
             accessoryView.leftAnchor.constraint(equalTo: clipView.leftAnchor),
             accessoryView.rightAnchor.constraint(equalTo: clipView.rightAnchor),
@@ -324,6 +362,7 @@ extension TitlebarTabsTahoeTerminalWindow {
                 .lineLimit(1)
                 .truncationMode(.tail)
                 .frame(maxWidth: .greatestFiniteMagnitude, alignment: .center)
+                .offset(y: TitlebarTabsTahoeTerminalWindow.titlebarContentShift)
                 .opacity(viewModel.hasTabBar ? 0 : 1) // hide when in fullscreen mode, where title bar will appear in the leading area under window buttons
         }
     }
