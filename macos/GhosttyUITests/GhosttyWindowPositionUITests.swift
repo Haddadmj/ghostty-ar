@@ -181,6 +181,43 @@ final class GhosttyWindowPositionUITests: GhosttyCustomConfigCase {
     @MainActor func testRestoredTransparent() throws { try runRestoreTest(titlebarStyle: "transparent") }
     @MainActor func testRestoredTabs() throws { try runRestoreTest(titlebarStyle: "tabs") }
 
+    // MARK: - Fullscreen does not overwrite the cached frame
+
+    @MainActor func testFullscreenCloseKeepsPosition() async throws {
+        try updateConfig(
+            """
+            window-width = 40
+            window-height = 20
+            title = "GhosttyWindowPositionUITests"
+            """
+        )
+
+        let app = try ghosttyApplication()
+        // Suppress Restoration
+        app.launchArguments += ["-NSQuitAlwaysKeepsWindows", "NO"]
+        // Clean run
+        app.launchEnvironment["GHOSTTY_CLEAR_USER_DEFAULTS"] = "YES"
+        app.launch()
+
+        let window = app.windows.firstMatch
+        XCTAssertTrue(window.waitForExistence(timeout: 5), "Window should appear")
+        let firstFrame = window.frame
+
+        // Enter fullscreen, then close the window while still in it.
+        app.typeKey("f", modifierFlags: [.command, .control])
+        try await Task.sleep(for: .seconds(2))
+        app.typeKey("w", modifierFlags: [.command])
+        try await Task.sleep(for: .seconds(1))
+        app.typeKey("n", modifierFlags: [.command])
+
+        let window2 = app.windows.firstMatch
+        XCTAssertTrue(window2.waitForExistence(timeout: 5), "New window should appear")
+        XCTAssertEqual(window2.frame.origin.x, firstFrame.origin.x, accuracy: 2, "x position should be restored")
+        XCTAssertEqual(window2.frame.origin.y, firstFrame.origin.y, accuracy: 2, "y position should be restored")
+
+        app.terminate()
+    }
+
     // MARK: - Config overrides cached position/size
 
     @MainActor

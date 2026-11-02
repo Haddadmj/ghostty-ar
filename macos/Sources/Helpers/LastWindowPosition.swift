@@ -13,6 +13,14 @@ class LastWindowPosition {
         // with the wrong one when window decorations change while creating,
         // e.g. adding a toolbar affects the window's frame.
         guard let window, window.isVisible else { return false }
+
+        // A fullscreen frame covers the whole screen, so restoring it would
+        // lose the window's real position. Native and non-native are checked
+        // separately because either can be active regardless of the style.
+        guard !window.styleMask.contains(.fullScreen),
+              (window as? TerminalWindow)?.terminalController?.fullscreenStyle?.isFullscreen != true
+        else { return false }
+
         let frame = window.frame
         let rect = [frame.origin.x, frame.origin.y, frame.size.width, frame.size.height]
         UserDefaults.ghostty.set(rect, forKey: positionKey)
